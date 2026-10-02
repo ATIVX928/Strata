@@ -716,6 +716,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME graph_registry_test COMMAND graph_registry_test)
   endif()
 
+  # ---- the V100 BF16 GEMM micro benchmark (bench/bf16_gemm_bench.cu) -------------------------
+  # The BF16 cuBLAS call against the cc < 8.0 FP16 fallback, on the prompt path's own shapes: speed with
+  # CUDA events and the fp32-tolerance numbers.  Not a ctest: it needs a GPU and prints measured figures.
+  if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench/bf16_gemm_bench.cu")
+    add_executable(bf16_gemm_bench bench/bf16_gemm_bench.cu)
+    target_include_directories(bf16_gemm_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(bf16_gemm_bench PRIVATE strata_prefill ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  endif()
+
   # ---- P2.S5's GATE: is a device<->pinned-memory handoff graph-capturable? --------------------
   # The doorbell protocol puts the D2H of `x_f` and the miss list INSIDE G[l] - that is the whole overlap.  The
   # phase doc says to verify this "before building on it", and this project has already lost two rounds to
