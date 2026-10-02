@@ -110,7 +110,7 @@ struct Smem7 {
     float alpha[16];
     float lsum[16];
     float mrow[16];
-    long long row[CH];
+    long long row[2][CH];        // double-buffered pool rows: the next chunk's lookups hide under p.v
 };
 
 template <int KV_MODE>
@@ -162,38 +162,71 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_sm70_kernel(const float* 
 #pragma unroll
         for (int i = 0; i < 8; ++i) acc[jt][i] = 0.0f;
 
-    for (int c0 = 0; c0 < n; c0 += CH) {
-        const int nh = min(CH, n - c0);
-        // the chunk's pool rows: -1 past the selection and for a page the KV streaming left non-resident (the
-        // decode kernel masks those, so this kernel does too)
-        if (t < CH) {
-            long long r = -1;
-            if (t < nh) {
-                const int cell = ids[c0 + t];
-                const long long page = (long long) p.page_table[cell / page_size];
-                if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
-            }
-            S.row[t] = r;
+    // the pool rows of a chunk: -1 past the selection and for a page the KV streaming left non-resident (the
+    // decode kernel masks those, so this kernel does too).  Chunk 0's rows fill one buffer here; every later
+    // chunk's lookups fill the other just before the previous p.v, where their global latency hides.
+    int rbuf = 0;
+    if (t < CH) {
+        long long r = -1;
+        if (t < min(CH, n)) {
+            const int cell = ids[t];
+            const long long page = (long long) p.page_table[cell / page_size];
+            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
         }
-        __syncthreads();
+        S.row[0][t] = r;
+    }
+    for (int c0 = 0; c0 < n; c0 += CH, rbuf ^= 1) {
+        const int nh = min(CH, n - c0);
+        __syncthreads();   // rows ready; the previous chunk's p.v is done with k, v
         // gather the chunk's K and V rows as FP16 (int8 codes converted exactly; K8V4's V dequantized from its
-        // q4_0 blocks) and their per-64-dim scales
+        // q4_0 blocks) and their per-64-dim scales.  Each thread issues ALL of its global loads before any of
+        // its stores: they then overlap each other instead of paying the HBM latency one at a time.
         {
-            for (int i = t; i < CH * (HD / 16); i += THREADS) {   // 16 dims per piece
-                const int c = i / (HD / 16), pc = i % (HD / 16);
-                const long long r = S.row[c];
-                __half* dk = &S.k[c][pc * 16];
+            constexpr int KPC = CH * (HD / 16);            // 16-dim pieces of a chunk
+            constexpr int KPT = (KPC + THREADS - 1) / THREADS;
+            static_assert(KPC % THREADS == 0, "the staging pieces divide evenly");
+            uint4 xk[KPT][2], xv[KPT][2];   // [piece][16B]: mode 0 fills both 16B, the int8 modes one
+            int kc[KPT], kp[KPT];
+            long long kr[KPT];
+#pragma unroll
+            for (int s = 0; s < KPT; ++s) {
+                const int i = t + s * THREADS;
+                kc[s] = i / (HD / 16); kp[s] = i % (HD / 16);
+                kr[s] = S.row[rbuf][kc[s]];
+                xk[s][0] = make_uint4(0, 0, 0, 0); xk[s][1] = make_uint4(0, 0, 0, 0);
+                xv[s][0] = make_uint4(0, 0, 0, 0); xv[s][1] = make_uint4(0, 0, 0, 0);
                 if constexpr (KV_MODE == 0) {
-                    uint4 x = make_uint4(0, 0, 0, 0);
-                    if (r >= 0) x = __ldg(reinterpret_cast<const uint4*>(p.k_pool + r * HD) + pc * 2);
-                    *reinterpret_cast<uint4*>(dk) = x;
-                    x = make_uint4(0, 0, 0, 0);
-                    if (r >= 0) x = __ldg(reinterpret_cast<const uint4*>(p.k_pool + r * HD) + pc * 2 + 1);
-                    *reinterpret_cast<uint4*>(dk + 8) = x;
+                    if (kr[s] >= 0) {
+                        const uint4* sk = reinterpret_cast<const uint4*>(p.k_pool + kr[s] * HD);
+                        const uint4* sv = reinterpret_cast<const uint4*>(p.v_pool + kr[s] * HD);
+                        xk[s][0] = __ldg(sk + kp[s] * 2); xk[s][1] = __ldg(sk + kp[s] * 2 + 1);
+                        xv[s][0] = __ldg(sv + kp[s] * 2); xv[s][1] = __ldg(sv + kp[s] * 2 + 1);
+                    }
                 } else {
-                    uint4 x = make_uint4(0, 0, 0, 0);
-                    if (r >= 0) x = __ldg(reinterpret_cast<const uint4*>(p.k_q + r * HD) + pc);
-                    store_i8x16_as_h16(dk, x);
+                    if (kr[s] >= 0) {
+                        xk[s][0] = __ldg(reinterpret_cast<const uint4*>(p.k_q + kr[s] * HD) + kp[s]);
+                        if constexpr (KV_MODE == 1)
+                            xv[s][0] = __ldg(reinterpret_cast<const uint4*>(p.v_q + kr[s] * HD) + kp[s]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int s = 0; s < KPT; ++s) {
+                __half* dk = &S.k[kc[s]][kp[s] * 16];
+                if constexpr (KV_MODE == 0) {
+                    *reinterpret_cast<uint4*>(dk) = xk[s][0];
+                    *reinterpret_cast<uint4*>(dk + 8) = xk[s][1];
+                } else {
+                    store_i8x16_as_h16(dk, xk[s][0]);
+                }
+                if constexpr (KV_MODE != 3) {
+                    __half* dv = &S.v[kc[s]][kp[s] * 16];
+                    if constexpr (KV_MODE == 0) {
+                        *reinterpret_cast<uint4*>(dv) = xv[s][0];
+                        *reinterpret_cast<uint4*>(dv + 8) = xv[s][1];
+                    } else {
+                        store_i8x16_as_h16(dv, xv[s][0]);
+                    }
                 }
             }
             if constexpr (KV_MODE == 3) {   // V: dequantize the row's q4_0 blocks straight into the fp16 V row
@@ -201,7 +234,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_sm70_kernel(const float* 
                 constexpr int BYTES = BLKS * (int) sizeof(block_q4_0);
                 for (int i = t; i < CH * BLKS; i += THREADS) {
                     const int c = i / BLKS, b = i % BLKS;
-                    const long long r = S.row[c];
+                    const long long r = S.row[rbuf][c];
                     __half* dv = &S.v[c][b * QK4_0];
 #pragma unroll
                     for (int j = 0; j < QK4_0; ++j) dv[j] = __half(0);
@@ -215,28 +248,10 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_sm70_kernel(const float* 
                         }
                     }
                 }
-            } else {
-                for (int i = t; i < CH * (HD / 16); i += THREADS) {
-                    const int c = i / (HD / 16), pc = i % (HD / 16);
-                    const long long r = S.row[c];
-                    __half* dv = &S.v[c][pc * 16];
-                    if constexpr (KV_MODE == 0) {
-                        uint4 x = make_uint4(0, 0, 0, 0);
-                        if (r >= 0) x = __ldg(reinterpret_cast<const uint4*>(p.v_pool + r * HD) + pc * 2);
-                        *reinterpret_cast<uint4*>(dv) = x;
-                        x = make_uint4(0, 0, 0, 0);
-                        if (r >= 0) x = __ldg(reinterpret_cast<const uint4*>(p.v_pool + r * HD) + pc * 2 + 1);
-                        *reinterpret_cast<uint4*>(dv + 8) = x;
-                    } else {
-                        uint4 x = make_uint4(0, 0, 0, 0);
-                        if (r >= 0) x = __ldg(reinterpret_cast<const uint4*>(p.v_q + r * HD) + pc);
-                        store_i8x16_as_h16(dv, x);
-                    }
-                }
             }
             for (int i = t; i < CH * 4; i += THREADS) {
                 const int c = i / 4, g = i % 4;
-                const long long r = S.row[c];
+                const long long r = S.row[rbuf][c];
                 float a = 0.0f, b = 0.0f;
                 if (r >= 0) {
                     if constexpr (KV_MODE == 1) {
@@ -259,8 +274,10 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_sm70_kernel(const float* 
         // them
         {
             const int cbase = (warp & 1) * 16, g = warp >> 1;
-            FragAcc f;
-            nvcuda::wmma::fill_fragment(f, 0.0f);
+            // two independent 4-step chains (a dependent WMMA chain costs 111 cycles on a V100), summed
+            FragAcc f0, f1;
+            nvcuda::wmma::fill_fragment(f0, 0.0f);
+            nvcuda::wmma::fill_fragment(f1, 0.0f);
 #pragma unroll
             for (int kk = 0; kk < 4; ++kk) {   // the group's 64 dims in 16-dim steps
                 const int d0 = g * 64 + kk * 16;
@@ -269,13 +286,14 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_sm70_kernel(const float* 
                 nvcuda::wmma::load_matrix_sync(ah, &S.qh[0][d0], QS);
                 nvcuda::wmma::load_matrix_sync(al, &S.ql[0][d0], QS);
                 nvcuda::wmma::load_matrix_sync(b, &S.k[cbase][d0], KROW);
+                FragAcc& f = kk < 2 ? f0 : f1;
                 nvcuda::wmma::mma_sync(f, ah, b, f);
                 nvcuda::wmma::mma_sync(f, al, b, f);
             }
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
                 const int row = acc_row(i), col = acc_col(i);
-                S.part[g][row][cbase + col] = f.x[i];
+                S.part[g][row][cbase + col] = f0.x[i] + f1.x[i];
             }
         }
         __syncthreads();
@@ -293,7 +311,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_sm70_kernel(const float* 
                 sc = fmaf(S.part[1][r][c], S.ks[c][1], sc);
                 sc = fmaf(S.part[2][r][c], S.ks[c][2], sc);
                 sc = fmaf(S.part[3][r][c], S.ks[c][3], sc);
-                x[j] = (c < nh && S.row[c] >= 0) ? sc * qdown : -INFINITY;
+                x[j] = (c < nh && S.row[rbuf][c] >= 0) ? sc * qdown : -INFINITY;
                 mx = fmaxf(mx, x[j]);
             }
 #pragma unroll
@@ -318,6 +336,17 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_sm70_kernel(const float* 
             }
         }
         __syncthreads();
+        // the next chunk's pool rows, into the other buffer: the two global lookups per cell hide under p.v
+        if (c0 + CH < n && t < CH) {
+            long long r = -1;
+            const int idx = c0 + CH + t;
+            if (idx < n) {
+                const int cell = ids[idx];
+                const long long page = (long long) p.page_table[cell / page_size];
+                if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+            }
+            S.row[rbuf ^ 1][t] = r;
+        }
         // p.v: warp w owns dims [32w, 32w+32), two tiles of the scale group (w >> 1).  The scale is folded into p
         // relative to the chunk's largest, times 2^14 (p' <= 2^14: its lo half stays out of FP16's subnormal range);
         // the chunk's sum is then added to the running one in FP32 with the factor taken back out (as the sm_75/80
@@ -345,19 +374,21 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_sm70_kernel(const float* 
                 }
 #pragma unroll
             for (int jt = 0; jt < 2; ++jt) {
-                FragAcc f;
-                nvcuda::wmma::fill_fragment(f, 0.0f);
+                // the hi and lo halves go into two 2-step chains (as the scores above) and add at the end
+                FragAcc fh, fl;
+                nvcuda::wmma::fill_fragment(fh, 0.0f);
+                nvcuda::wmma::fill_fragment(fl, 0.0f);
 #pragma unroll
                 for (int kt = 0; kt < CH / 16; ++kt) {
                     FragBr b;
                     nvcuda::wmma::load_matrix_sync(b, &S.v[kt * 16][dim0 + jt * 16], VROW);
-                    nvcuda::wmma::mma_sync(f, ah[kt], b, f);
-                    nvcuda::wmma::mma_sync(f, al[kt], b, f);
+                    nvcuda::wmma::mma_sync(fh, ah[kt], b, fh);
+                    nvcuda::wmma::mma_sync(fl, al[kt], b, fl);
                 }
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
                     const int row = acc_row(i);
-                    acc[jt][i] = fmaf(acc[jt][i], S.alpha[row], f.x[i] * vdown);
+                    acc[jt][i] = fmaf(acc[jt][i], S.alpha[row], (fh.x[i] + fl.x[i]) * vdown);
                 }
             }
         }

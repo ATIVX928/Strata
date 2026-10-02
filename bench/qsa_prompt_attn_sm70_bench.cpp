@@ -36,10 +36,12 @@ template <typename T> T* up(const std::vector<T>& h) {
 uint16_t f2h(float f) { __half h = __float2half(f); return *reinterpret_cast<uint16_t*>(&h); }
 
 // one synthetic prompt: the widest selection the shape has (2,051 cells at 32K), a recent window plus older cells
-// that drift slowly from query to query, as qsa_prompt_attn_parity builds them
+// that drift slowly from query to query, as qsa_prompt_attn_parity builds them.  fmt 1 int8 KV, 0 fp16 KV,
+// 2 hybrid K8V4 (int8 K, q4_0 V - the Q2_0 engine's pools)
 void build(int fmt, int64_t ctx, int64_t nq, std::vector<int8_t>& kq, std::vector<int8_t>& vq, std::vector<uint16_t>& ks,
-           std::vector<uint16_t>& vs, std::vector<uint16_t>& kh, std::vector<uint16_t>& vh, std::vector<int32_t>& table,
-           std::vector<int32_t>& ids, std::vector<int32_t>& steps, std::vector<float>& q, int64_t& cap) {
+           std::vector<uint16_t>& vs, std::vector<uint16_t>& kh, std::vector<uint16_t>& vh, std::vector<uint8_t>& vq4,
+           std::vector<int32_t>& table, std::vector<int32_t>& ids, std::vector<int32_t>& steps, std::vector<float>& q,
+           int64_t& cap) {
     const k::QsaShapes s = k::qsa_real_shapes();
     const int64_t HD = s.head_dim, NKV = s.n_head_kv, NH = s.n_head, PS = s.page_size;
     const int64_t pages = (ctx + PS - 1) / PS, rows = pages * NKV * PS;
@@ -47,12 +49,22 @@ void build(int fmt, int64_t ctx, int64_t nq, std::vector<int8_t>& kq, std::vecto
     std::normal_distribution<float> nd(0.f, 1.f);
     std::uniform_int_distribution<int> code(-127, 127);
     std::uniform_real_distribution<float> sc(0.005f, 0.03f);
-    if (fmt == 1) {
-        kq.resize(rows * HD); vq.resize(rows * HD); ks.resize(rows * 4); vs.resize(rows * 4);
+    if (fmt == 1 || fmt == 2) {
+        kq.resize(rows * HD); ks.resize(rows * 4);
         for (auto& x : kq) x = (int8_t) code(rng);
-        for (auto& x : vq) x = (int8_t) code(rng);
         for (auto& x : ks) x = f2h(sc(rng));
-        for (auto& x : vs) x = f2h(sc(rng));
+        if (fmt == 1) {
+            vq.resize(rows * HD); vs.resize(rows * 4);
+            for (auto& x : vq) x = (int8_t) code(rng);
+            for (auto& x : vs) x = f2h(sc(rng));
+        } else {
+            vq4.resize((size_t) (rows * (HD / 32) * 18));   // q4_0 blocks: a finite fp16 scale + random nibbles
+            for (size_t i = 0; i < vq4.size(); i += 18) {
+                const uint16_t d = f2h(sc(rng));
+                vq4[i] = (uint8_t) d; vq4[i + 1] = (uint8_t) (d >> 8);
+                for (int j = 2; j < 18; ++j) vq4[i + j] = (uint8_t) rng();
+            }
+        }
     } else {
         kh.resize(rows * HD); vh.resize(rows * HD);
         for (auto& x : kh) x = f2h(nd(rng) * 1.5f);
@@ -118,12 +130,14 @@ void run(int fmt, int64_t ctx, int64_t nq, int reps) {
     const int64_t HD = s.head_dim, NH = s.n_head;
     std::vector<int8_t> kq, vq;
     std::vector<uint16_t> ks, vs, kh, vh;
+    std::vector<uint8_t> vq4;
     std::vector<int32_t> table, ids, steps;
     std::vector<float> q;
     int64_t cap = 0;
-    build(fmt, ctx, nq, kq, vq, ks, vs, kh, vh, table, ids, steps, q, cap);
+    build(fmt, ctx, nq, kq, vq, ks, vs, kh, vh, vq4, table, ids, steps, q, cap);
     k::QsaAttnPools pl;
     if (fmt == 1) { pl.k_q = up(kq); pl.v_q = up(vq); pl.k_scale = up(ks); pl.v_scale = up(vs); }
+    else if (fmt == 2) { pl.k_q = up(kq); pl.k_scale = up(ks); pl.v_q4 = up(vq4); }
     else { pl.k_pool = up(kh); pl.v_pool = up(vh); }
     pl.page_table = up(table);
     const int32_t* d_ids = up(ids);
@@ -135,8 +149,8 @@ void run(int fmt, int64_t ctx, int64_t nq, int reps) {
     ck(cudaMalloc(&d_new, nq * NH * HD * 4), "malloc");
     ck(cudaMalloc(&scratch, batch * k::qsa_decode_attn_scratch_floats(cap, s) * 4), "malloc");
     std::printf("# %s KV, ctx %lld, selection %lld cells, %lld queries of %lld heads x %lld dims\n",
-                fmt == 1 ? "int8" : "fp16", (long long) ctx, (long long) cap, (long long) nq, (long long) NH,
-                (long long) HD);
+                fmt == 1 ? "int8" : fmt == 2 ? "int8+q4 V (K8V4)" : "fp16", (long long) ctx, (long long) cap,
+                (long long) nq, (long long) NH, (long long) HD);
     const int64_t counts[] = {16, 64, 256, 1024, 2048, 4096};
     for (int64_t nqi : counts) {
         if (nqi > nq) continue;
@@ -168,6 +182,7 @@ void run(int fmt, int64_t ctx, int64_t nq, int reps) {
     cudaFree((void*) d_ids); cudaFree((void*) d_steps); cudaFree((void*) d_q); cudaFree(d_old); cudaFree(d_new);
     cudaFree(scratch);
     cudaFree((void*) pl.k_q); cudaFree((void*) pl.v_q); cudaFree((void*) pl.k_scale); cudaFree((void*) pl.v_scale);
+    cudaFree((void*) pl.v_q4);
     cudaFree((void*) pl.k_pool); cudaFree((void*) pl.v_pool); cudaFree((void*) pl.page_table);
 }
 }  // namespace
@@ -177,6 +192,7 @@ int main(int argc, char** argv) {
     const int64_t nq = argc > 2 ? std::atoll(argv[2]) : 2048;
     const int reps = argc > 3 ? std::atoi(argv[3]) : 10;
     run(1, ctx, nq, reps);
+    run(2, ctx, nq, reps);
     run(0, ctx, nq, reps);
     return 0;
 }
