@@ -161,6 +161,20 @@ __global__ void gu_kernel(const uint8_t* __restrict__ blob_base, const int32_t* 
 // `silu(gate) * up` lives in `strata/kernels/swiglu.cuh` (the fused kernels call it in their epilogues);
 // the standalone pass it replaced is gone.  The scratch layout is unchanged: `[0, n_pairs)` ends up holding
 // the products, `[n_pairs, 2*n_pairs)` the raw up rows.
+#if !defined(STRATA_V100_OPT)
+/// `silu(gate) * up`, in place, over a GATE-MAJOR buffer: `[0, n_pairs)` is every hit's gate and
+/// `[n_pairs, 2*n_pairs)` is every hit's up, so hit `h`'s row `r` meets itself at `h*FF + r`.
+///
+/// SiLU on the GATE and multiplied by up - the reading `docs/semantics.md` records, and the one that is wrong
+/// the other way round in a way that still produces a finite number.
+__global__ void swiglu_kernel(float* __restrict__ gate_up, long long n_pairs) {
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_pairs) return;
+    const float g = gate_up[i];
+    const float u = gate_up[n_pairs + i];
+    gate_up[i] = (g / (1.0f + __expf(-g))) * u;
+}
+#endif
 
 /// DOWN, ONE WARP PER ROW, reading the quantized intermediate the caller produced.
 ///
@@ -594,10 +608,18 @@ void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, con
     //    `x_scales` the intermediate takes the CPU's contract (`quantize_q8_0_scaled`), R4.2h.
     {
         const long long pairs = n_hits * (long long) FF;
+#if defined(STRATA_V100_OPT)
         if (x_scales != nullptr)
             swilu_quantize_q8_0_scaled(gate_up, gate_up + pairs, gate_up, pairs, 1, h_q8_0, h_scales, stream);
         else
             swilu_quantize_q8_0(gate_up, gate_up + pairs, gate_up, pairs, 1, h_q8_0, stream);
+#else
+        const unsigned blocks = (unsigned) ((pairs + THREADS - 1) / THREADS);
+        swiglu_kernel<<<blocks, THREADS, 0, cs>>>(gate_up, pairs);
+        check("moe_hit_grouped_s2/swiglu", stream);
+        if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, n_hits * (int64_t) FF, stream);
+        else quantize_q8_0(gate_up, h_q8_0, n_hits * (int64_t) FF, stream);
+#endif
     }
     // 4. down.
     {
@@ -690,10 +712,17 @@ void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index,
     // sentinel rows included - the parity test compares that scratch).
     {
         const long long pairs = cap * (long long) FF;
+#if defined(STRATA_V100_OPT)
         if (x_scales != nullptr)
             swilu_quantize_q8_0_scaled(gate_up, gate_up + pairs, gate_up, pairs, 1, h_q8_0, h_scales, stream);
         else
             swilu_quantize_q8_0(gate_up, gate_up + pairs, gate_up, pairs, 1, h_q8_0, stream);
+#else
+        swiglu_kernel<<<(unsigned) ((pairs + THREADS - 1) / THREADS), THREADS, 0, cs>>>(gate_up, pairs);
+        check("moe_hit_grouped_s2_dev/swiglu", stream);
+        if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, cap * (int64_t) FF, stream);
+        else quantize_q8_0(gate_up, h_q8_0, cap * (int64_t) FF, stream);
+#endif
     }
     {
         launch_hit_down(fast, blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
@@ -727,10 +756,17 @@ void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_inde
     }
     {
         const long long pairs = cap * (long long) FF;
+#if defined(STRATA_V100_OPT)
         if (x_scales != nullptr)
             swilu_quantize_q8_0_scaled(gate_up, gate_up + pairs, gate_up, pairs, 1, h_q8_0, h_scales, stream);
         else
             swilu_quantize_q8_0(gate_up, gate_up + pairs, gate_up, pairs, 1, h_q8_0, stream);
+#else
+        swiglu_kernel<<<(unsigned) ((pairs + THREADS - 1) / THREADS), THREADS, 0, cs>>>(gate_up, pairs);
+        check("moe_hit_grouped_s2_multi/swiglu", stream);
+        if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, cap * (int64_t) FF, stream);
+        else quantize_q8_0(gate_up, h_q8_0, cap * (int64_t) FF, stream);
+#endif
     }
     {
         launch_hit_down(fast, blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
@@ -1111,10 +1147,17 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
     }
     {
         const long long pairs = cap_entries * (long long) FF;
+#if defined(STRATA_V100_OPT)
         if (x_scales != nullptr)
             swilu_quantize_q8_0_scaled(gate_up, gate_up + pairs, gate_up, pairs, 1, h_q8_0, h_scales, stream);
         else
             swilu_quantize_q8_0(gate_up, gate_up + pairs, gate_up, pairs, 1, h_q8_0, stream);
+#else
+        swiglu_kernel<<<(unsigned) ((pairs + THREADS - 1) / THREADS), THREADS, 0, cs>>>(gate_up, pairs);
+        check("moe_grouped_s2/swiglu", stream);
+        if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, cap_entries * (int64_t) FF, stream);
+        else quantize_q8_0(gate_up, h_q8_0, cap_entries * (int64_t) FF, stream);
+#endif
     }
     {
         const dim3 grid((unsigned) (H / D_ROWS), (unsigned) cap_groups);
