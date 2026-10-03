@@ -27,6 +27,7 @@
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
+#include "strata/kernels/s2_qpn8.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -2675,7 +2676,7 @@ int main(int argc, char** argv) {
         const int64_t mtp_bind = (!o.mtp.empty() && native_head.loaded())
                                      ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind;
-        int64_t slots = ((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+        int64_t slots = ((int64_t) free_b - reserve) / strata::kernels::s2_qpn8_slot_bytes((int64_t) strata::kernels::cpu::expert_layout().max_blob);
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
         std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
@@ -2692,7 +2693,7 @@ int main(int argc, char** argv) {
         cudaMemGetInfo(&free_b, &total_b);
         const int64_t prefill_mib = (o.prefill_chunk > 0 && !pf_borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
-        const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob, 0);
+        const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / strata::kernels::s2_qpn8_slot_bytes((int64_t) strata::kernels::cpu::expert_layout().max_blob), 0);
         if (o.expert_cache > fit) {
             // a WARNING that names the knob: the user asked for this size, and gets fewer slots
             std::fprintf(stderr, "strata generate: WARNING: layer split: --expert-cache %d leaves no room for the "
@@ -2735,7 +2736,7 @@ int main(int argc, char** argv) {
                 sized_slots.resize(keep);
                 o.expert_cache = (int) keep;
             } else {
-                o.expert_cache = (int) (keep_bytes / (int64_t) strata::kernels::cpu::expert_layout().max_blob);
+                o.expert_cache = (int) (keep_bytes / strata::kernels::s2_qpn8_slot_bytes((int64_t) strata::kernels::cpu::expert_layout().max_blob));
             }
             if (o.expert_cache <= 0) { o.expert_cache = 0; sized_slots.clear(); return false; }
             return true;
@@ -3074,7 +3075,7 @@ int main(int argc, char** argv) {
         drive.d.cache = &xcache;
         drive.d.cache_stream = main_cs;
         drive.d.cache_base = (const uint8_t*) xcache.device_slot(0);
-        drive.d.cache_blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+        drive.d.cache_blob = strata::kernels::s2_qpn8_slot_bytes((int64_t) strata::kernels::cpu::expert_layout().max_blob);
         drive.d.cache_slot_off = xcache.slot_offsets();
         drive.d.hit_scratch = hit_scratch;
         drive.d.parts_out = d_parts;
@@ -3713,7 +3714,7 @@ int main(int argc, char** argv) {
     }
     auto lend_slots = [&](int64_t c) -> int64_t {
         const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, c);
-        const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+        const int64_t blob = strata::kernels::s2_qpn8_slot_bytes((int64_t) strata::kernels::cpu::expert_layout().max_blob);
         int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
         if (xcache.slot_offsets() != nullptr) {   // sized slots: take slots from the end until they hold `need`
             k = 0;
@@ -3852,14 +3853,14 @@ int main(int argc, char** argv) {
                        (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[xc.slots() - k]) < need) ++k;
                 return k;
             }
-            const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+            const int64_t blob = strata::kernels::s2_qpn8_slot_bytes((int64_t) strata::kernels::cpu::expert_layout().max_blob);
             return (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
         };
         auto part_bytes = [&](const PfPart& p, int32_t first) -> uint64_t {
             strata::core::ExpertCache& xc = *p.cache;
             return xc.slot_offsets() ? (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[first])
                                      : (uint64_t) (xc.slots() - first) *
-                                           (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
+                                           (uint64_t) strata::kernels::s2_qpn8_slot_bytes((int64_t) strata::kernels::cpu::expert_layout().max_blob);
         };
         // #340: a layer split whose caches already hold most experts streams few of them through the prompt path, so
         // the 384-slot ring (sized for a card that streams nearly every expert of a chunk) only makes every stage's
@@ -5717,7 +5718,7 @@ int main(int argc, char** argv) {
             } else if (chunk != o.prefill_chunk) {
                 k = 0;                                 // a fixed chunk that does not fit: its own buffers, as before
             }
-            const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+            const int64_t blob = strata::kernels::s2_qpn8_slot_bytes((int64_t) strata::kernels::cpu::expert_layout().max_blob);
             if (k > 0) {   // the lent slots are refilled after the prompt
                 const int32_t first = (int32_t) (xcache.slots() - k);
                 for (size_t i = 0; i < host_res.size(); ++i)

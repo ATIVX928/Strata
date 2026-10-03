@@ -7,6 +7,7 @@
 #include "strata/core/native_head.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/s2_qpn8.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/native_router.hpp"
@@ -746,19 +747,25 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         float* hit_out = hit_out_ + (size_t) tb * K * N;
         const auto& lay = strata::kernels::cpu::expert_layout();
         // plan v0.3 P6: the VRAM groups now; the PCIe groups once the copy engine has landed them in staging
-        auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn) {
+        // `vram` = the groups whose blobs are this cache's dual-form slots; the PCIe share below is staged
+        // canonical bytes and keeps the DP4A kernels (s2_qpn8.hpp).
+        auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, bool vram) {
             if (lay.native) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];
                 const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
                 native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
                                       nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, hit_out, cs);
+            } else if (vram && strata::kernels::s2_qpn8_active()) {
+                moe_grouped_s2_qpn8(gp, gs, gn, p_dst, p_tok, cap, cap, (int64_t) lay.blob_bytes(l),
+                                    hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32),
+                                    hit_scratch_, hit_out, cs);
             } else {
                 moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
                                hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, hit_out, cs);
             }
         };
-        grouped(p_ptr, p_start, p_counts);
+        grouped(p_ptr, p_start, p_counts, true);
         stamp(l, 20, grp);
         if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
         else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
@@ -769,7 +776,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
         }
         stamp(l, 21, grp);
-        grouped(p_ptr2, p_start2, p_counts + 2);
+        grouped(p_ptr2, p_start2, p_counts + 2, false);
         stamp(l, 22, grp);
         if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
             wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
