@@ -74,6 +74,13 @@ if(STRATA_ENABLE_CUDA)
   # be brought in explicitly for the host-side tests that call cudaMalloc themselves.
   find_package(CUDAToolkit REQUIRED)
   option(STRATA_EXPERIMENTAL_SM60 "community build for GPUs below compute capability 7.5: Pascal sm_60, Volta sm_70 (#236)" OFF)
+  # v100-opt: the community V100 (sm_70) optimizations - Volta tensor-core prompt attention, grouped verify
+  # attention, the QPN8 expert GEMV, GDN chain-split/chunked recurrence, the bit-exact GEMV/quantize fusions,
+  # the BF16-via-FP16 prefill GEMM, the int8 KV gather and the NVLink P2P layer-split hand-off.  OFF is the
+  # trunk: those sources are not compiled, every entry point falls back to the original path and the engine is
+  # bit-for-bit what upstream main builds.  ON also admits sm_70 (it defines STRATA_EXPERIMENTAL_SM60=1 on
+  # strata_core, see below), so `-DSTRATA_EXPERIMENTAL_V100=ON` alone is a runnable V100 build.
+  option(STRATA_EXPERIMENTAL_V100 "community V100 (sm_70) optimizations: Volta tensor-core attention, P2P hand-off, fusions, ..." OFF)
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
   endif()
@@ -91,11 +98,11 @@ if(STRATA_ENABLE_CUDA)
     # bit-exact for the first and merely a shorter pause for the second (sm_70 has both).  Community-tested,
     # not in the ready-made engine; RTX 20/30/40/50 cards must use the release engine instead.  It needs a CUDA
     # 12.x toolkit: CUDA 13 dropped sm_60 and sm_70 (nvcc fails CMake's compiler test with "compute_70").
-    if(_base LESS 75 AND NOT STRATA_EXPERIMENTAL_SM60)
+    if(_base LESS 75 AND NOT STRATA_EXPERIMENTAL_SM60 AND NOT STRATA_EXPERIMENTAL_V100)
       message(FATAL_ERROR
         "Strata needs an NVIDIA GPU of compute capability 7.5 or newer (RTX 20 / 30 / 40 / 50 series), but "
         "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}'.  (A Pascal sm_60 or Volta sm_70 build is "
-        "-DSTRATA_EXPERIMENTAL_SM60=ON; upstream does not support it.)")
+        "-DSTRATA_EXPERIMENTAL_SM60=ON or -DSTRATA_EXPERIMENTAL_V100=ON; upstream does not support it.)")
     endif()
     if(_base LESS 60)
       message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES '${CMAKE_CUDA_ARCHITECTURES}': even the experimental build "
@@ -182,9 +189,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp
                                src/core/layout.cpp)
   target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  if(STRATA_ENABLE_CUDA AND STRATA_EXPERIMENTAL_SM60)
-    # the runtime device check (src/core/device.cu) admits the cards this build was made for (#236)
+  if(STRATA_ENABLE_CUDA AND (STRATA_EXPERIMENTAL_SM60 OR STRATA_EXPERIMENTAL_V100))
+    # the runtime device check (src/core/device.cu) admits the cards this build was made for (#236).  The V100
+    # build doubles as an sm_60 build here (both are below the sm_75 floor) so the same kMinCc = 60 is used.
     target_compile_definitions(strata_core PRIVATE STRATA_EXPERIMENTAL_SM60=1)
+  endif()
+  if(STRATA_EXPERIMENTAL_V100)
+    # the V100 optimization gates (#if defined(STRATA_V100_OPT)) in every target that carries one
+    target_compile_definitions(strata_core PRIVATE STRATA_V100_OPT=1)
   endif()
   # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
   # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
@@ -222,7 +234,6 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # reference is the whole point - a kernel checked against another copy of itself proves nothing.
   add_library(strata_kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_gemv.cu
                           src/kernels/cuda/s_gemv.cu
-                          src/kernels/cuda/s_gemv_pair.cu
                           src/kernels/cuda/s2_gemv_quads.cu
                           src/kernels/cuda/s2_gemv_fast.cu
                           src/kernels/cuda/router_top10.cu
@@ -231,7 +242,6 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/sampler.cu
                           src/kernels/cuda/s2_gemv_q8.cu
     src/kernels/cuda/s2_expert_grouped.cu
-    src/kernels/cuda/s2_qpn8.cu
                           src/kernels/cuda/shared_expert.cu
                           src/kernels/cuda/gr.cu
                           src/kernels/cuda/gdn.cu
@@ -259,9 +269,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/fused_gr.cu
                           src/kernels/cuda/cvec.cu
                           src/kernels/cuda/qsa_decode_attn.cu
-                          src/kernels/cuda/qsa_grouped_attn.cu
                           src/kernels/cuda/qsa_prompt_attn.cu
-                          src/kernels/cuda/qsa_prompt_attn_sm70.cu
                           src/kernels/cuda/fused_gdn.cu
                           src/kernels/cuda/dequant_bf16.cu
                           src/kernels/cuda/qsa_select.cu
@@ -271,22 +279,34 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
+  if(STRATA_EXPERIMENTAL_V100 AND NOT STRATA_ENABLE_HIP)
+    # the V100-only kernels: OFF (the trunk) they are not in the library at all and the header stubs keep every
+    # caller on the original path; ON they provide the optimizations and STRATA_V100_OPT gates their call sites.
+    target_sources(strata_kernels PRIVATE
+      src/kernels/cuda/qsa_grouped_attn.cu
+      src/kernels/cuda/qsa_prompt_attn_sm70.cu
+      src/kernels/cuda/s2_qpn8.cu
+      src/kernels/cuda/s_gemv_pair.cu)
+    target_compile_definitions(strata_kernels PRIVATE STRATA_V100_OPT=1)
+  endif()
   # perf-review D-1: the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
   # the tests, or alone with -DSTRATA_PARITY_PROMPT_ATTN=ON.  CUDA only: HIP compiles the tensor-core kernel out.
   if((STRATA_BUILD_TESTS OR STRATA_PARITY_PROMPT_ATTN) AND STRATA_ENABLE_CUDA)
     add_executable(qsa_prompt_attn_parity src/kernels/qsa_prompt_attn_parity.cpp)
     target_include_directories(qsa_prompt_attn_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels CUDA::cudart)
-    # the Volta (sm_70) prompt attention against the FP32 kernel it replaces: a small GPU microbench (CUDA events,
-    # real shapes, run by hand under one card)
-    add_executable(qsa_prompt_attn_sm70_bench bench/qsa_prompt_attn_sm70_bench.cpp)
-    target_include_directories(qsa_prompt_attn_sm70_bench PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-    target_link_libraries(qsa_prompt_attn_sm70_bench PRIVATE strata_kernels CUDA::cudart)
-    # V100 grouped verify attention vs the FP32 kernel and FP64 (GPU, synthetic, no model)
-    add_executable(qsa_grouped_attn_parity src/kernels/qsa_grouped_attn_parity.cpp)
-    target_include_directories(qsa_grouped_attn_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-    target_link_libraries(qsa_grouped_attn_parity PRIVATE strata_kernels CUDA::cudart)
-    add_test(NAME qsa_grouped_attn_parity COMMAND qsa_grouped_attn_parity --selftest)
+    if(STRATA_EXPERIMENTAL_V100)
+      # the Volta (sm_70) prompt attention against the FP32 kernel it replaces: a small GPU microbench (CUDA events,
+      # real shapes, run by hand under one card); the grouped parity exercise the V100 kernels directly
+      add_executable(qsa_prompt_attn_sm70_bench bench/qsa_prompt_attn_sm70_bench.cpp)
+      target_include_directories(qsa_prompt_attn_sm70_bench PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+      target_link_libraries(qsa_prompt_attn_sm70_bench PRIVATE strata_kernels CUDA::cudart)
+      # V100 grouped verify attention vs the FP32 kernel and FP64 (GPU, synthetic, no model)
+      add_executable(qsa_grouped_attn_parity src/kernels/qsa_grouped_attn_parity.cpp)
+      target_include_directories(qsa_grouped_attn_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+      target_link_libraries(qsa_grouped_attn_parity PRIVATE strata_kernels CUDA::cudart)
+      add_test(NAME qsa_grouped_attn_parity COMMAND qsa_grouped_attn_parity --selftest)
+    endif()
   endif()
   # the QSA selection (block scores on the warp kernel and the tensor-core one, top-k): a GPU bench with a
   # scorer-vs-scorer comparison and an FP64 accuracy gate (synthetic, no model); the ctest runs a 32K context under a
@@ -357,6 +377,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  if(STRATA_EXPERIMENTAL_V100)
+    target_compile_definitions(strata_engine PRIVATE STRATA_V100_OPT=1)
+  endif()
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/file_expert_source_test.cpp")
     enable_testing()
     add_executable(file_expert_source_test tests/core/file_expert_source_test.cpp)
@@ -406,9 +429,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # what composes them into a token.  No tokenizer - the prompt arrives as ids - because Gate C1 compares logits
   # against llama.cpp on the SAME ids and a tokenizer on one side of that comparison is a second variable.
   # plan v0.3 P5: batched prompt processing (tensor-core GEMMs through cuBLAS).
-  add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/gdn_chunk.cu src/prefill/prefill.cpp)
+  add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
   target_include_directories(strata_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata_prefill PUBLIC strata_engine ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  if(STRATA_EXPERIMENTAL_V100 AND NOT STRATA_ENABLE_HIP)
+    target_sources(strata_prefill PRIVATE src/prefill/gdn_chunk.cu)
+    target_compile_definitions(strata_prefill PRIVATE STRATA_V100_OPT=1)
+  endif()
   if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)
     target_compile_definitions(strata_prefill PRIVATE STRATA_HIPBLASLT_AVAILABLE=1)
     target_link_libraries(strata_prefill PRIVATE roc::hipblaslt)
@@ -420,6 +447,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(strata src/program/generate.cpp)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+  if(STRATA_EXPERIMENTAL_V100)
+    target_compile_definitions(strata PRIVATE STRATA_V100_OPT=1)
+  endif()
 
   if(STRATA_ENABLE_HIP)
     enable_testing()
@@ -581,16 +611,19 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
 
   # v100/gdn-chunk: the chunked GDN prompt recurrence vs the token recurrence and a host reference (GPU,
   # synthetic, no model).  The chunked path changes the summation order - FP32-level, not bit-exact - so the
-  # test asserts measured error bounds, and --selftest pins them.
-  add_executable(gdn_chunk_parity src/kernels/gdn_chunk_parity.cpp)
-  target_include_directories(gdn_chunk_parity PRIVATE ${_strata_gpu_include_directories})
-  target_link_libraries(gdn_chunk_parity PRIVATE strata_prefill ${_strata_gpu_runtime_target})
-  add_test(NAME gdn_chunk_parity COMMAND gdn_chunk_parity --selftest)
+  # test asserts measured error bounds, and --selftest pins them.  Only built with the V100 switch (the source
+  # is not in OFF builds).
+  if(STRATA_EXPERIMENTAL_V100)
+    add_executable(gdn_chunk_parity src/kernels/gdn_chunk_parity.cpp)
+    target_include_directories(gdn_chunk_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(gdn_chunk_parity PRIVATE strata_prefill ${_strata_gpu_runtime_target})
+    add_test(NAME gdn_chunk_parity COMMAND gdn_chunk_parity --selftest)
 
-  # v100/gdn-chunk: the micro benchmark (CUDA events, real GDN shapes): chunked vs recurrent prompt path.
-  add_executable(gdn_chunk_bench bench/gdn_chunk_bench.cpp)
-  target_include_directories(gdn_chunk_bench PRIVATE ${_strata_gpu_include_directories})
-  target_link_libraries(gdn_chunk_bench PRIVATE strata_prefill ${_strata_gpu_runtime_target})
+    # v100/gdn-chunk: the micro benchmark (CUDA events, real GDN shapes): chunked vs recurrent prompt path.
+    add_executable(gdn_chunk_bench bench/gdn_chunk_bench.cpp)
+    target_include_directories(gdn_chunk_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(gdn_chunk_bench PRIVATE strata_prefill ${_strata_gpu_runtime_target})
+  endif()
 
   add_executable(s2_gemv_q8_parity src/kernels/s2_gemv_q8_parity.cpp)
   target_include_directories(s2_gemv_q8_parity PRIVATE ${_strata_gpu_include_directories})
@@ -640,11 +673,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
 
   # the V100 fusion work: every fused kernel against its unfused pipeline, bitwise, and the before/after
   # CUDA-event timings at decode shapes (`--bench`).  It is a .cu because it carries the unfused reference
-  # kernels it compares against.
-  add_executable(fusions_parity bench/micro/fusions_parity.cu)
-  target_include_directories(fusions_parity PRIVATE ${_strata_gpu_include_directories})
-  target_link_libraries(fusions_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
-  add_test(NAME fusions_parity COMMAND fusions_parity)
+  # kernels it compares against.  Only built with the V100 switch (the fused kernels are not in OFF builds).
+  if(STRATA_EXPERIMENTAL_V100)
+    add_executable(fusions_parity bench/micro/fusions_parity.cu)
+    target_include_directories(fusions_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(fusions_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME fusions_parity COMMAND fusions_parity)
+  endif()
 
   add_executable(s_gemv_q8k_parity src/kernels/s_gemv_q8k_parity.cpp)
   target_include_directories(s_gemv_q8k_parity PRIVATE ${_strata_gpu_include_directories})
@@ -709,10 +744,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
 
   # The V100 QPN8 repack + m8n8k4 path vs the DP4A kernels (GPU, synthetic): the per-chunk terms must be
   # bit-exact and the outputs within the measured float-order bound.  Requires STRATA_QPN8=1 (skips otherwise).
-  add_executable(s2_qpn8_parity src/kernels/s2_qpn8_parity.cpp)
-  target_include_directories(s2_qpn8_parity PRIVATE ${_strata_gpu_include_directories})
-  target_link_libraries(s2_qpn8_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
-  add_test(NAME s2_qpn8_parity COMMAND s2_qpn8_parity --selftest)
+  # Only built with the V100 switch (the QPN8 source is not in OFF builds).
+  if(STRATA_EXPERIMENTAL_V100)
+    add_executable(s2_qpn8_parity src/kernels/s2_qpn8_parity.cpp)
+    target_include_directories(s2_qpn8_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(s2_qpn8_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME s2_qpn8_parity COMMAND s2_qpn8_parity --selftest)
+  endif()
 
   # Plan v0.3 P3: native MMVQ for 1..8 tokens (bitwise selftest + --bench timing); synthetic data, no model.
   if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench/micro/native_mmvq_multi.cpp")

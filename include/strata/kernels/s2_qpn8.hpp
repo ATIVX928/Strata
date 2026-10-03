@@ -60,6 +60,7 @@
 
 namespace strata::kernels {
 
+#if defined(STRATA_V100_OPT)
 /// The gate: true only on compute capability 7.0 with `STRATA_QPN8=1`.  Read once per process; the env is
 /// the switch, the cc check keeps sm_75+ (and the sm_80+ trunk) on the existing kernels no matter what.
 bool s2_qpn8_active();
@@ -87,5 +88,25 @@ void moe_grouped_s2_qpn8(const unsigned long long* grp_ptr, const int32_t* grp_s
                          const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
                          int64_t blob_bytes, const uint8_t* x_q8_0, const float* x_scales, void* scratch,
                          float* out, void* stream);
+#else
+// The V100 switch is off: the QPN8 source is not compiled.  These stubs are the trunk policy - no device is
+// eligible (so no slot doubles, no repack runs, the grouped verify path stays on the DP4A kernels) and the
+// canonical blob is the only geometry.  The gate is deliberately `active() && env STRATA_QPN8` when compiled.
+inline bool s2_qpn8_active() { return false; }
+inline int64_t s2_qpn8_blob_bytes() { return 1382400; }
+inline int64_t s2_qpn8_slot_bytes(int64_t blob) { return blob; }
+inline void s2_qpn8_repack_blob(uint8_t* dst, const uint8_t* src, int64_t blob_bytes, void* stream) {
+    (void) dst; (void) src; (void) blob_bytes; (void) stream;
+}
+inline void moe_grouped_s2_qpn8(const unsigned long long* grp_ptr, const int32_t* grp_start,
+                                const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok,
+                                int64_t cap_groups, int64_t cap_entries, int64_t blob_bytes,
+                                const uint8_t* x_q8_0, const float* x_scales, void* scratch, float* out,
+                                void* stream) {
+    (void) grp_ptr; (void) grp_start; (void) n_groups; (void) ent_dst; (void) ent_tok; (void) cap_groups;
+    (void) cap_entries; (void) blob_bytes; (void) x_q8_0; (void) x_scales; (void) scratch; (void) out;
+    (void) stream;
+}
+#endif
 
 }  // namespace strata::kernels

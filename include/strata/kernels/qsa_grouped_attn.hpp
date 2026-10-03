@@ -37,8 +37,19 @@ namespace strata::kernels {
 /// `qsa_decode_attn_scratch_floats(cap, s)` floats) holds the split-K partial rows.  Returns false and launches
 /// NOTHING when the device is not cc < 80, n_q is outside 2..8, the geometry is not 24/2/256 or the pools are
 /// missing.
+#if defined(STRATA_V100_OPT)
 bool qsa_grouped_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                             int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q,
                             void* stream);
+#else
+// The V100 switch is off: the grouped kernel is not compiled and every caller stays on the FP32 path.
+inline bool qsa_grouped_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids,
+                                   const int32_t* steps, int64_t cap, const QsaShapes& s, float* scratch,
+                                   float* attn, int64_t n_q, void* stream) {
+    (void) q; (void) pools; (void) ids; (void) steps; (void) cap; (void) s; (void) scratch; (void) attn;
+    (void) n_q; (void) stream;
+    return false;
+}
+#endif
 
 }  // namespace strata::kernels

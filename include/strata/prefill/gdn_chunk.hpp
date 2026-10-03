@@ -57,6 +57,7 @@
 
 namespace strata::prefill {
 
+#if defined(STRATA_V100_OPT)
 /// Is the chunked recurrence worth dispatching to on this device?  Volta (cc 7.0) only - that is where the
 /// token chain hurts and where this was measured; every other architecture keeps the existing recurrence.
 bool gdn_chunk_available();
@@ -74,5 +75,14 @@ bool gdn_chunk_available();
 /// Scratch (A, P and the cumsum) is a grow-only static workspace, segmented so a 32k prompt does not size it.
 void gdn_chunk_recurrence(float* state, const float* h, const float* gate, const float* beta, float* oc,
                           int64_t T, void* stream);
+#else
+// The V100 switch is off: the chunked source is not compiled and the recurrence in kernels.cu keeps the trunk's
+// token path.  `gdn_chunk_available()` is the dispatch gate, so false here is what makes the original path run.
+inline bool gdn_chunk_available() { return false; }
+inline void gdn_chunk_recurrence(float* state, const float* h, const float* gate, const float* beta, float* oc,
+                                 int64_t T, void* stream) {
+    (void) state; (void) h; (void) gate; (void) beta; (void) oc; (void) T; (void) stream;
+}
+#endif
 
 }  // namespace strata::prefill
