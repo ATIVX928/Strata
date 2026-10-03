@@ -529,23 +529,50 @@ __global__ void __launch_bounds__(HD) group_combine_kernel(const float* __restri
 
 // ---- host side -------------------------------------------------------------
 
+inline int grouped_dev() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
+        cudaGetLastError();   // do not leave a probe error for a later error check to pick up
+        return 0;
+    }
+    return dev;
+}
+
+// The shared-memory opt-in AND the capability probe are context properties of a DEVICE, not of the
+// process: a --layer-split runs this kernel on two cards and each card's context must be opted in
+// before its 63 KiB dynamic-smem launch is captured into the verify window's graph.  A process-global
+// `static bool` let device 1 reuse device 0's success, skip its own opt-in, and the resulting failed
+// launch invalidated the capture ("operation failed due to a previous error during capture").  Keep
+// one record per device.  Every probe/opt-in failure clears the runtime error with cudaGetLastError():
+// a refused opt-in sends the caller down the FP32 fallback, and the leaked error would otherwise
+// surface later in that fallback's own cudaGetLastError() as a spurious abort.
+struct GroupedDev {
+    int cc = 0;              // 10*major + minor, 0 = not probed
+    int smem_cap = 0;        // cudaDevAttrMaxSharedMemoryPerBlockOptin (emulation-aware), 0 = not probed
+    int optin[4] = {};       // per KV_MODE: 0 = not tried, 1 = opted in, -1 = refused
+};
+inline GroupedDev& grouped_state() {
+    static GroupedDev by_dev[64];
+    return by_dev[grouped_dev()];
+}
+
 int grouped_cc() {
-    static int cc[64] = {};
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
         cudaGetLastError();
         return -1;
     }
-    if (cc[dev] == 0) {
+    GroupedDev& d = grouped_state();
+    if (d.cc == 0) {
         int major = 0, minor = 0;
         if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
             cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
             cudaGetLastError();
             return -1;
         }
-        cc[dev] = 10 * strata::cc_major_of(major) + strata::cc_minor_of(minor);
+        d.cc = 10 * strata::cc_major_of(major) + strata::cc_minor_of(minor);
     }
-    return cc[dev];
+    return d.cc;
 }
 
 int grouped_env() {   // -1 default (cc gate), 0 off, 1 on; read per call so a test can A/B in one process
@@ -554,37 +581,30 @@ int grouped_env() {   // -1 default (cc gate), 0 off, 1 on; read per call so a t
     return std::atoi(e) == 0 ? 0 : 1;
 }
 
-inline int grouped_dev() {
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return 0;
-    return dev;
-}
-
-// The shared-size opt-in is a per-DEVICE setting and a layer split runs this kernel on two cards.  A
-// process-global `static bool` made the second device skip its own opt-in, so its 63 KiB dynamic-smem
-// launch failed and, because it happened inside the verify window's cudaStreamBeginCapture, invalidated
-// the capture ("operation failed due to a previous error during capture").  Track one flag per device.
 template <int KV_MODE>
 bool set_attr() {
-    static bool ok[64] = {};
-    const int dev = grouped_dev();
-    if (!ok[dev]) {
-        ok[dev] = cudaFuncSetAttribute(grouped_attn_kernel<KV_MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                       (int) sizeof(Smem)) == cudaSuccess;
+    GroupedDev& d = grouped_state();
+    if (d.optin[KV_MODE] == 0) {
+        const bool ok = cudaFuncSetAttribute(grouped_attn_kernel<KV_MODE>,
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem)) ==
+                        cudaSuccess;
+        d.optin[KV_MODE] = ok ? 1 : -1;
+        cudaGetLastError();   // a refused opt-in must not poison the capture the fallback continues in
     }
-    return ok[dev];
+    return d.optin[KV_MODE] == 1;
 }
 
-// The capability probe is per device for the same reason as the opt-in above.
 inline bool smem_ok() {
-    static int cap[64] = {};
-    const int dev = grouped_dev();
-    if (cap[dev] == 0) {
+    GroupedDev& d = grouped_state();
+    if (d.smem_cap == 0) {
         int optin = 0;
-        if (cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess) return false;
-        cap[dev] = strata::smem_optin_of(optin);
+        if (cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, grouped_dev()) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        d.smem_cap = strata::smem_optin_of(optin);
     }
-    return (int) sizeof(Smem) <= cap[dev];
+    return (int) sizeof(Smem) <= d.smem_cap;
 }
 
 template <int KV_MODE>
