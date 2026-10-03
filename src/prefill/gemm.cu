@@ -468,23 +468,31 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
 void Gemm::bf16_via_f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                         float beta) {
     // X converted into the scratch, W served from its FP16 twin when the cache holds one.  The cache is an
-    // optimization only - a miss (or a disabled cache) converts W per call into the scratch after X's region,
-    // in N-row slices when the scratch cannot hold it all (the `native` dequant's own pattern).
+    // optimization only - a miss (or a disabled cache) converts W per call into the scratch after X's region.
     const uint16_t* w16 = f16_twin(W, N, K);
     const int64_t kmax = std::max<int64_t>(K, 1);
-    const int64_t xroom = w16 != nullptr ? scratch_elems_ : scratch_elems_ - kmax;   // room for one W row
-    if (xroom < kmax) {
+    if (scratch_elems_ < kmax) {
         std::fprintf(stderr, "prefill gemm: scratch too small for K=%lld\n", (long long) K);
         std::exit(1);
     }
-    const int64_t xt = std::min(T, xroom / kmax);
+    if (w16 != nullptr) {
+        const int64_t xt = std::min(T, std::max<int64_t>(1, scratch_elems_ / kmax));
+        for (int64_t t0 = 0; t0 < T; t0 += xt) {
+            const int64_t t = std::min(xt, T - t0);
+            strata::kernels::bf16_to_f16_bulk(X + t0 * K, scratch_, t * K, stream_);
+            f16(scratch_, w16, Y + t0 * ldy, t, N, K, ldy, beta);
+        }
+        return;
+    }
+    // No twin: the scratch holds the X tile AND a W slab at the same time, so the W slab never collapses.
+    // The old layout sized the X tile from nearly the whole scratch and then took whatever was left for W;
+    // with K >= scratch/(2*T) (every hc projection here: K=10240, T=8192) that left `rows == 1` and the
+    // "fallback" became N one-row GEMMs - 50-1000x slower than the BF16 call it was replacing.  Sizing the
+    // X tile from half the scratch keeps `rows >= xt` for every shape.
+    const int64_t xt = std::min(T, std::max<int64_t>(1, scratch_elems_ / (2 * kmax)));
     for (int64_t t0 = 0; t0 < T; t0 += xt) {
         const int64_t t = std::min(xt, T - t0);
         strata::kernels::bf16_to_f16_bulk(X + t0 * K, scratch_, t * K, stream_);
-        if (w16 != nullptr) {
-            f16(scratch_, w16, Y + t0 * ldy, t, N, K, ldy, beta);
-            continue;
-        }
         const int64_t rows = std::max<int64_t>(1, (scratch_elems_ - t * K) / kmax);
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = std::min(rows, N - r0);
