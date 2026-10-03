@@ -70,6 +70,7 @@
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#define cudaMemcpyPeerAsync hipMemcpyPeerAsync
 #define cudaMemset hipMemset
 #define cudaMemsetAsync hipMemsetAsync
 #define cudaPeekAtLastError hipPeekAtLastError
