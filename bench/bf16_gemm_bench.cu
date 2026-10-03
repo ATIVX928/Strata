@@ -203,6 +203,12 @@ int main(int argc, char** argv) {
         {256, 128, 2560, "indexer.k 2560x128"},
         {256, 512, 2560, "indexer.q 2560x512"},
         {256, 2560, 2560, "ple_value 2560x2560"},
+        {8192, 320, 10240, "prefill hc_down 10240x320"},
+        {8192, 10240, 320, "prefill hc_up 320x10240"},
+        {8192, 4, 10240, "prefill hc_inject 10240x4"},
+        {8192, 2560, 2560, "prefill ple_value 2560x2560"},
+        {8192, 512, 2560, "prefill indexer.q 2560x512"},
+        {8192, 1, 2560, "prefill shared gate 2560x1"},
     };
 
     std::printf("\n%-26s %3s %10s %10s %10s %10s %10s | %10s %10s %10s\n", "shape", "T", "bf16 ms", "f16 ms", "nocache",
