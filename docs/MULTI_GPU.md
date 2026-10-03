@@ -145,3 +145,13 @@ The Coder on an RTX 5080 + RTX 3090 (Ryzen 9 9950X3D), 32K context; details in
 - Leave out a much slower card when two already hold the model. An RTX 2080 Ti as a third card made the 5080 +
   3090 pair slower (68 / 90 tok/s decode): every extra card costs its own round per window.
 - More cards pay off when the model's routed experts do not fit the faster ones.
+
+## The V100 (sm_70) build
+
+The community V100 optimizations (Volta tensor-core attention, the P2P hand-off above, the fused GEMV/quantize
+paths, the BF16-via-FP16 prefill GEMM and the int8 KV gather) live behind one build switch,
+`-DSTRATA_EXPERIMENTAL_V100=ON`. Off - the default - is the trunk: those sources are not compiled and every entry
+point takes its original path, bit-for-bit. On, they run when the device is a V100; the older `STRATA_QPN8`,
+`STRATA_SPLIT_P2P`, `STRATA_GROUPED_ATTN` and `STRATA_GDN_CHUNK` variables remain per-feature A/B switches on top.
+`STRATA_EXPERIMENTAL_V100=1` before `setup.sh`/`START-HERE.bat` passes the switch to the build; as with
+`STRATA_EXPERIMENTAL_SM60` it needs a CUDA 12.x toolkit (CUDA 13 dropped sm_70).
