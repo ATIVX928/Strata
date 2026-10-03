@@ -175,9 +175,11 @@ void run() {
     };
     cudaDeviceProp prop{};
     ck(cudaGetDeviceProperties(&prop, 0), "props");
+    const char* only = std::getenv("STRATA_QPN8_BENCH_SHAPE");
     std::printf("s2_qpn8_parity --bench: the entry points on %s (us per window call, 20 reps)\n", prop.name);
     std::printf("  %-24s %10s %10s %8s\n", "shape (all entries shared)", "unpack DP4A", "repack m8n8k4", "ratio");
     for (const Shape& s : shapes) {
+        if (only != nullptr && std::strstr(s.what, only) == nullptr) continue;
         const int groups = s.g, entries = groups * s.ne;
         std::vector<unsigned long long> gptr(groups);
         std::vector<int32_t> gstart(groups + 1), ng(1), edst(entries), etok(entries);
