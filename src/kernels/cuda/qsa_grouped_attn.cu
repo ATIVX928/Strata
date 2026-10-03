@@ -554,12 +554,37 @@ int grouped_env() {   // -1 default (cc gate), 0 off, 1 on; read per call so a t
     return std::atoi(e) == 0 ? 0 : 1;
 }
 
+inline int grouped_dev() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return 0;
+    return dev;
+}
+
+// The shared-size opt-in is a per-DEVICE setting and a layer split runs this kernel on two cards.  A
+// process-global `static bool` made the second device skip its own opt-in, so its 63 KiB dynamic-smem
+// launch failed and, because it happened inside the verify window's cudaStreamBeginCapture, invalidated
+// the capture ("operation failed due to a previous error during capture").  Track one flag per device.
 template <int KV_MODE>
 bool set_attr() {
-    static const bool ok =
-        cudaFuncSetAttribute(grouped_attn_kernel<KV_MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             (int) sizeof(Smem)) == cudaSuccess;
-    return ok;
+    static bool ok[64] = {};
+    const int dev = grouped_dev();
+    if (!ok[dev]) {
+        ok[dev] = cudaFuncSetAttribute(grouped_attn_kernel<KV_MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                       (int) sizeof(Smem)) == cudaSuccess;
+    }
+    return ok[dev];
+}
+
+// The capability probe is per device for the same reason as the opt-in above.
+inline bool smem_ok() {
+    static int cap[64] = {};
+    const int dev = grouped_dev();
+    if (cap[dev] == 0) {
+        int optin = 0;
+        if (cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess) return false;
+        cap[dev] = strata::smem_optin_of(optin);
+    }
+    return (int) sizeof(Smem) <= cap[dev];
 }
 
 template <int KV_MODE>
@@ -596,13 +621,7 @@ bool qsa_grouped_attn_batch(const float* q, const QsaAttnPools& pools, const int
                                                         pools.k_scale == nullptr || pools.v_scale == nullptr)
                                                      : (pools.k_pool == nullptr || pools.v_pool == nullptr))))
         return false;
-    static const int smem_ok = (int) sizeof(Smem) <= [] {
-        int dev = 0, optin = 0;
-        if (cudaGetDevice(&dev) != cudaSuccess) return 0;
-        if (cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess) return 0;
-        return strata::smem_optin_of(optin);
-    }();
-    if (!smem_ok) return false;
+    if (!smem_ok()) return false;
     const bool attr = kv_mode == 0 ? set_attr<0>() : kv_mode == 1 ? set_attr<1>() : kv_mode == 2 ? set_attr<2>()
                                                                                                 : set_attr<3>();
     if (!attr) return false;
