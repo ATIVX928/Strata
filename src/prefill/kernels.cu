@@ -276,6 +276,7 @@ __global__ void gdn_l2_kernel(float* __restrict__ h, float eps) {
 }
 constexpr int RG = 4, RPG = S / RG;
 constexpr int CB = 32, NCB = S / CB;  // value columns per block kernel / blocks per head
+#if defined(STRATA_V100_OPT)
 // v100/gdn-chunk: the same recurrence with WARP-LOCAL reductions - no __syncthreads at all.  gdn_rec_cols_*'
 // per-token shape is two cross-warp reductions (k^T W and q^T W) behind two barriers each (six barriers per
 // token in the pipelined kernel); here a warp owns 8 columns and the 4 row-groups are lanes within the warp,
@@ -327,6 +328,7 @@ __global__ void __launch_bounds__(S) gdn_rec_cols_warp_kernel(float* __restrict_
 #pragma unroll
     for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
 }
+#endif
 __global__ void __launch_bounds__(S * RG) gdn_rec_kernel(float* __restrict__ state, const float* __restrict__ h,
                                                          const float* __restrict__ gate,
                                                          const float* __restrict__ beta, const float* __restrict__ z,
@@ -491,6 +493,7 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_pipe_kernel(float* __res
 // cycles before the barriers); the split keeps the load pattern, the barriers and the (S, h_v, S) state
 // layout untouched.  FP32-level, NOT bit-exact - the four partial sums group the 32 products differently -
 // so it is opt-in by measured benefit (STRATA_GDN_REC_WARP=2; gdn_chunk_parity bounds the error).
+#if defined(STRATA_V100_OPT)
 __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_pipe_fast_kernel(float* __restrict__ state,
                                                                         const float* __restrict__ h,
                                                                         const float* __restrict__ gate,
@@ -548,6 +551,7 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_pipe_fast_kernel(float* 
 #pragma unroll
     for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
 }
+#endif
 
 __global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
                                                          float eps, float* __restrict__ y, uint16_t* __restrict__ y16) {
@@ -860,6 +864,7 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream) {
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;   // the one-block-per-head kernel (A/B)
+#if defined(STRATA_V100_OPT)
     // v100/gdn-chunk: the chunked recurrence (src/prefill/gdn_chunk.cu) on Volta, where the token chain is the
     // cost.  STRATA_GDN_CHUNK=0 forces the recurrence, =1 forces the chunked path (the parity test's A/B switch);
     // unset: cc == 7.0 only, every other architecture keeps the recurrence bit-for-bit as before.  Read per call
@@ -894,7 +899,9 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
         else
             gdn_rec_cols_warp_kernel<<<HV * NCB, S, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
         gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16);
-    } else if (serial || T <= 0) {
+    } else
+#endif
+    if (serial || T <= 0) {
         gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T);
     } else {
         static const bool pipe = [] { const char* v = std::getenv("STRATA_GDN_PIPELINE"); return v == nullptr || std::atoi(v) != 0; }();

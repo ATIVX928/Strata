@@ -97,6 +97,9 @@ int64_t bf16_twins_cap_bytes() {
 // BF16 call, anything else = take the FP16 path).  Re-read at every init so one process can hold one Gemm of
 // each flavor (the micro benchmark's A/B); the engine reads it once per session at most.
 bool bf16_as_f16_auto() {
+#if !defined(STRATA_V100_OPT)
+    return false;   // the V100 switch is off: the BF16 cuBLAS call is the trunk (STRATA_PREFILL_BF16_F16 ignored)
+#else
     const char* e = std::getenv("STRATA_PREFILL_BF16_F16");
     const int forced = e == nullptr ? -1 : std::atoi(e);
     if (forced == 0) return false;
@@ -106,6 +109,7 @@ bool bf16_as_f16_auto() {
     int major = 0;
     if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) return false;
     return major < 8;
+#endif
 }
 #else
 // AMD: the BF16 GEMM is native there (hipBLASLt / HIP_R_16BF) and this V100 route is not taken at all.

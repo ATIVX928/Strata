@@ -141,7 +141,12 @@ bool split_handoff_p2p(int src_dev, int dst_dev, std::string* note) {
         if (note != nullptr) *note = why;
         return false;
     };
-#if defined(STRATA_USE_HIP)
+#if !defined(STRATA_V100_OPT)
+    // the V100 switch is off: the hand-off is always the pinned-RAM path (the trunk), whatever the env says
+    (void) src_dev;
+    (void) dst_dev;
+    return host("through pinned RAM");
+#elif defined(STRATA_USE_HIP)
     (void) src_dev;
     (void) dst_dev;
     return host("through pinned RAM");
