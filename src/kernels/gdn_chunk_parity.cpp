@@ -12,12 +12,14 @@
 //   3. chunked vs recurrence directly: the observable switch STRATA_GDN_CHUNK flips.
 //
 // Both GPU paths go through the REAL dispatch (`gdn_recurrence`), A/B'd with the env switch, so the tail
-// (< 64 tokens) and the output norm are part of what is compared - final y and the final state, the two
-// things the layer hands on.
+// (< 64 tokens) and the output norm are part of what is compared - the recurrence kernels' raw FP32 output for
+// the kernel comparisons (0.1.38's gdn_out_norm_kernel leaves it in place and writes only the FP16 copy), and
+// the norm's FP16 output once against the host reference's normalized values.
 #include "strata/prefill/gdn_chunk.hpp"
 #include "strata/prefill/kernels.hpp"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include <cmath>
 #include <cstdio>
@@ -38,6 +40,13 @@ void check(cudaError_t e, const char* what) {
     }
 }
 
+// the FP16 store's value back as FP32, for the one normalized-output comparison
+float half_to_float(uint16_t u) {
+    __half h;
+    std::memcpy(&h, &u, 2);
+    return __half2float(h);
+}
+
 // deterministic LCG - the same inputs on every machine and every run
 struct Rng {
     uint64_t s;
@@ -49,14 +58,17 @@ struct Rng {
 };
 
 /// The GDN chunk as a double-precision transcription of the recurrence in strata/kernels/gdn.hpp: the state
-/// (S, h_v, S) f32 layout, decay BEFORE the rank-1 update, modulo head pairing, and the out norm exactly as
+/// (S, h_v, S) f32 layout, decay BEFORE the rank-1 update, modulo head pairing.  `yraw_out` is the raw output
+/// the recurrence kernels leave for gdn_out_norm_kernel; `y_out` is the norm's value, formed exactly as
 /// gdn_out_norm_kernel forms it (sqrt(S) in the oc scale, +eps on the SCALED squared norm).
 void ref_full(const std::vector<float>& st0, const std::vector<float>& h, const std::vector<float>& gate,
               const std::vector<float>& beta, const std::vector<float>& z, const std::vector<float>& gamma,
-              float eps, int64_t T, std::vector<float>& y_out, std::vector<float>& st_out) {
+              float eps, int64_t T, std::vector<float>& yraw_out, std::vector<float>& y_out,
+              std::vector<float>& st_out) {
     std::vector<double> st((size_t) S * HV * S);
     for (size_t i = 0; i < st.size(); ++i) st[i] = (double) st0[i];
     y_out.assign((size_t) T * HV * S, 0.0f);
+    yraw_out.assign((size_t) T * HV * S, 0.0f);
     std::vector<double> o(S);
     for (int64_t t = 0; t < T; ++t) {
         for (int hh = 0; hh < HV; ++hh) {
@@ -79,6 +91,7 @@ void ref_full(const std::vector<float>& st0, const std::vector<float>& h, const 
             for (int j = 0; j < S; ++j) ss += o[j] * o[j];
             const double rs = 1.0 / std::sqrt(ss / (double) S + (double) eps);
             for (int j = 0; j < S; ++j) {
+                yraw_out[((size_t) t * HV + hh) * S + j] = (float) o[j];
                 const double sig = 1.0 / (1.0 + std::exp(-(double) z[(size_t) t * HV * S + hh * S + j]));
                 y_out[((size_t) t * HV + hh) * S + j] = (float) (o[j] * rs * (double) gamma[j] * sig);
             }
@@ -143,8 +156,8 @@ void run_case(int64_t T, uint64_t seed) {
     for (size_t i = 0; i < st0.size(); ++i) st0[i] = 0.1f * (rng.uni() - 0.5f);
     const float eps = 1e-5f;
 
-    std::vector<float> y_ref, st_ref;
-    ref_full(st0, h, gate, beta, z, gamma, eps, T, y_ref, st_ref);
+    std::vector<float> y_ref, yraw_ref, st_ref;
+    ref_full(st0, h, gate, beta, z, gamma, eps, T, yraw_ref, y_ref, st_ref);
 
     float *d_st = nullptr, *d_h = nullptr, *d_g = nullptr, *d_b = nullptr, *d_z = nullptr, *d_ga = nullptr,
           *d_y = nullptr, *d_st0 = nullptr;
@@ -168,7 +181,8 @@ void run_case(int64_t T, uint64_t seed) {
     std::vector<float> y_gpu(y_ref.size()), st_gpu(st0.size());
     std::vector<float> y_rec(y_ref.size()), st_rec(st0.size()), y_warp(y_ref.size()), st_warp(st0.size()),
         y_fast(y_ref.size()), st_fast(st0.size()), y_fma(y_ref.size()), st_fma(st0.size());
-    auto run = [&](const char* chunk, const char* warp, std::vector<float>& y, std::vector<float>& st) {
+    auto run = [&](const char* chunk, const char* warp, std::vector<float>& y, std::vector<float>& st,
+                   std::vector<float>* y16f = nullptr) {
         setenv("STRATA_GDN_CHUNK", chunk, 1);
         setenv("STRATA_GDN_REC_WARP", warp, 1);
         check(cudaMemcpy(d_st, d_st0, st0.size() * 4, cudaMemcpyDeviceToDevice), "D2D");
@@ -176,8 +190,15 @@ void run_case(int64_t T, uint64_t seed) {
         check(cudaDeviceSynchronize(), "sync");
         check(cudaMemcpy(y.data(), d_y, y.size() * 4, cudaMemcpyDeviceToHost), "D2H");
         check(cudaMemcpy(st.data(), d_st, st.size() * 4, cudaMemcpyDeviceToHost), "D2H");
+        if (y16f != nullptr) {
+            std::vector<uint16_t> h16(y.size());
+            check(cudaMemcpy(h16.data(), d_y16, h16.size() * 2, cudaMemcpyDeviceToHost), "D2H");
+            y16f->resize(y.size());
+            for (size_t i = 0; i < y.size(); ++i) (*y16f)[i] = half_to_float(h16[i]);
+        }
     };
-    run("0", "0", y_rec, st_rec);    // the old pipelined recurrence
+    std::vector<float> y16_rec;
+    run("0", "0", y_rec, st_rec, &y16_rec);  // the old pipelined recurrence (+ the norm's FP16 output)
     run("0", "1", y_warp, st_warp);  // the sync-free warp recurrence - must be BIT-EXACT vs the above
     run("0", "2", y_fast, st_fast);  // the chain-split recurrence (the V100 default)
     run("1", "0", y_gpu, st_gpu);    // the chunked path's wmma variant
@@ -191,13 +212,14 @@ void run_case(int64_t T, uint64_t seed) {
     std::printf("  %-38s %s\n", "warp recurrence vs pipelined (bits)", bits ? "FAIL" : "bit-exact");
     if (bits) ++failures;
 
-    Err e_yr, e_y, e_yf, e_ym, e_yc, e_sr, e_s, e_sf, e_sm, e_sc;
+    Err e_yr, e_y, e_yf, e_ym, e_yc, e_yn, e_sr, e_s, e_sf, e_sm, e_sc;
     for (size_t i = 0; i < y_ref.size(); ++i) {
-        e_yr.see(y_rec[i], y_ref[i]);
-        e_yf.see(y_fast[i], y_ref[i]);
-        e_ym.see(y_fma[i], y_ref[i]);
-        e_y.see(y_gpu[i], y_ref[i]);
+        e_yr.see(y_rec[i], yraw_ref[i]);
+        e_yf.see(y_fast[i], yraw_ref[i]);
+        e_ym.see(y_fma[i], yraw_ref[i]);
+        e_y.see(y_gpu[i], yraw_ref[i]);
         e_yc.see(y_gpu[i], y_rec[i]);
+        e_yn.see(y16_rec[i], y_ref[i]);
     }
     for (size_t i = 0; i < st_ref.size(); ++i) {
         e_sr.see(st_rec[i], st_ref[i]);
@@ -210,12 +232,14 @@ void run_case(int64_t T, uint64_t seed) {
     // the reference magnitude).  The recurrence is the FP32 floor; the FMA chunked path reorders the sums
     // (FP32-level, not bit-exact - qsa_prompt_attn.hpp's precedent); the wmma chunked path additionally
     // stages q/k/v and the state through FP16 (the reference's "f32 -> f16 暂存"), which is the error level
-    // llama.cpp-v100's FlashQLA sm70 path ships with.
+    // llama.cpp-v100's FlashQLA sm70 path ships with.  The y rows compared here are the recurrence kernels'
+    // raw output (0.1.38's norm keeps its FP32 store out); the last line reads the norm's FP16 copy instead.
     expect("recurrence vs host ref (y)", e_yr, 5e-6f, 1e-2f);
     expect("chain-split recurrence (y)", e_yf, 1e-5f, 2e-2f);
     expect("chunked FMA vs host ref (y)", e_ym, 1e-5f, 2e-2f);
     expect("chunked wmma vs host ref (y)", e_y, 6e-3f, 5e1f);
     expect("chunked wmma vs recurrence (y)", e_yc, 6e-3f, 5e1f);
+    expect("output norm (FP16) vs host ref (y)", e_yn, 8e-3f, 5e-2f);
     expect("recurrence vs host ref (state)", e_sr, 1e-7f, 5e-4f);
     expect("chain-split recurrence (state)", e_sf, 5e-7f, 2e-3f);
     expect("chunked FMA vs host ref (state)", e_sm, 5e-7f, 2e-3f);

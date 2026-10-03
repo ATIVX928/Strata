@@ -9,7 +9,8 @@ speed comes from (decode then barely touches the CPU pool).
 This is pipeline (layer) parallelism, not tensor parallelism: a token crosses from one card to the next once per
 verify window (a few hundred KB) and once per prompt chunk (tens of MB), not twice per layer. The hand-off goes
 through **peer-to-peer when the cards can peer** (NVLink or PCIe P2P) and through pinned host RAM otherwise; cards
-on x4 or x1 slots work either way, and the PCIe share of each card is probed on its own link. `STRATA_SPLIT_P2P=0`
+on x4 or x1 slots work either way, and the PCIe share of each card is probed on its own link. A `--pcie-frac` you give
+is every card's share and skips those probes; there is no per-card setting yet. `STRATA_SPLIT_P2P=0`
 forces the pinned path, `=1` forces peer access wherever the cards support it - the A/B is bit-identical (the
 hand-off is a copy, not arithmetic). On 2x V100-SXM2 with NVLink (`nvidia-smi topo` NV2) the link measured 48.3 GB/s
 against 3.3 GB/s through pinned RAM: 0.015 ms per 8-token verify window instead of 0.122, and 1.74 s of copies for
