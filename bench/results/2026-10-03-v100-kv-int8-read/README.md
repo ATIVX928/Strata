@@ -46,4 +46,22 @@ streaming and hybrid paths use.
 
 ## 3. int8 vs q4_0 vs k8v4 at 32k
 
-TBD
+`kv_q8_parity --bench`, same 32k pool and 2,051-cell selection, K+V gather:
+
+| format | B/cell | 32k x 12 layers | gather | GB/s |
+|---|---|---|---|---|
+| fp16   | 2048 | 768 MiB | - | - |
+| int8   | 1056 | 396 MiB | 13.9 us | 455 |
+| q4_0   | 576  | 216 MiB | 32.0 us | 168 |
+| k8v4  | 816  | 306 MiB | - (int8 K + q4 V) | - |
+
+q4_0 moves half of int8's bytes yet is 2.3x slower: `kv_gather_q4_kernel` (`kv_q4.cu:139-173`) is one thread
+per value and index-bound, not bandwidth-bound. That only matters in the non-fast/streaming gather path; the
+default `g_fast_attn` decode is `load8_q4`/`load8_q8` and is not gather-bound.
+
+**V100 / 32k recommendation:** stay on `--kv int8`. It is the fastest decode, needs no Hadamard rotation, and
+its worst case (0.59 quantization steps vs fp16) is near-lossless. The 12 QSA layers cost 396 MiB vs 768 MiB in
+fp16 - the 372 MiB saved is what a 16 GB V100 needs for a longer context. Use `--kv k8v4` (306 MiB) only when
+VRAM is the hard limit: its K is the same exact int8, so the selection and the scores are unchanged, and only V
+is compressed. Prefer k8v4 over q4_0 in that case, since q4_0 also quantizes K (rotated), its gather is slow in
+the fallback path, and it saves only another 90 MiB over twelve layers.
